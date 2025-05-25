@@ -2,9 +2,35 @@ import re
 import csv
 import requests
 from bs4 import BeautifulSoup
-import wikipedia
 import datetime
 import pytz
+
+# === OpenRouter Setup ===
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = "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"  # Replace with your actual key
+
+
+def query_openrouter(prompt):
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": "mistralai/mistral-7b-instruct:free",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant. Keep your answers short and easy to understand."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3
+    }
+    try:
+        response = requests.post(OPENROUTER_API_URL, headers=headers, json=data)
+        response.raise_for_status()
+        result = response.json()
+        return result['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        print(f"Error with OpenRouter API: {e}")
+        return None
 
 # === Load synonyms for simplification ===
 synonym_dict = {}
@@ -13,7 +39,7 @@ try:
         reader = csv.DictReader(f)
         for row in reader:
             raw = row['difficult'].strip().lower()
-            key = re.sub(r'\d+$', '', raw)            # strip any trailing digits
+            key = re.sub(r'\d+$', '', raw)
             easy = row.get('easy', row.get('simple', '')).strip()
             if key and easy:
                 synonym_dict[key] = easy
@@ -32,14 +58,6 @@ def simplify_text(text):
             return w
         return s.capitalize() if w[0].isupper() else s
     return re.sub(r"\b\w+\b", replace, text)
-
-def search_wikipedia(query, sentences=2):
-    try:
-        return wikipedia.summary(query, sentences=sentences)
-    except (wikipedia.exceptions.DisambiguationError, wikipedia.exceptions.PageError):
-        return None
-    except:
-        return None
 
 def search_web(query):
     try:
@@ -61,23 +79,11 @@ def search_web(query):
         pass
     return None
 
-def get_time(city='UTC'):
-    city_key = city.strip().replace(' ', '_').title()
-    tz_name = None
-    for tz in pytz.all_timezones:
-        if tz.endswith('/' + city_key):
-            tz_name = tz
-            break
-    if not tz_name:
-        for tz in pytz.all_timezones:
-            if '/' + city_key + '/' in tz:
-                tz_name = tz
-                break
-    if not tz_name:
-        tz_name = 'UTC'
+def get_time(city='Islamabad'):
     try:
-        now = datetime.datetime.now(pytz.timezone(tz_name))
-        return now.strftime('%Y-%m-%d %H:%M:%S %Z')
+        tz = pytz.timezone('Asia/Karachi')
+        now = datetime.datetime.now(tz)
+        return f"The current time in {city.title()} is {now.strftime('%I:%M %p')}"
     except:
         return None
 
@@ -92,7 +98,7 @@ def get_weather(city='Pakistan'):
 GOALS = {
     'weather':    r"\bweather\b.*\bin\b\s*(?P<city>[\w\s]+)",
     'time':       r"\btime\b.*\bin\b\s*(?P<city>[\w\s]+)",
-    'define':     r"\b(?:define|definition)\b.*\bof\b\s*(?P<topic>.+)",
+    'define':     r"\b(?:define|definition|what is|explain|describe)\b.*\b(?P<topic>.+)",
     'simplify':   r"\b(?:simplify|make it easier|easy version)\b",
     'search':     r".+"
 }
@@ -110,19 +116,19 @@ def plan(goal, params):
     if goal == 'time':
         return [('time', params.get('city'))]
     if goal in ('define',):
-        return [('wiki', params.get('topic'))]
+        return [('openrouter', params.get('topic'))]
     if goal == 'simplify':
         return [('simplify', None)]
-    return [('wiki', params.get('query')), ('web', params.get('query'))]
+    return [('openrouter', params.get('query')), ('web', params.get('query'))]
 
 def execute(steps, last_resp):
     for action, arg in steps:
         if action == 'weather':
             res = get_weather(arg or 'Pakistan')
         elif action == 'time':
-            res = get_time(arg or 'UTC')
-        elif action == 'wiki':
-            res = search_wikipedia(arg)
+            res = get_time(arg or 'Islamabad')
+        elif action == 'openrouter':
+            res = query_openrouter(arg)
         elif action == 'web':
             res = search_web(arg)
         elif action == 'simplify':
@@ -138,7 +144,7 @@ def execute(steps, last_resp):
 def main():
     print("=== Goal‑Based AI Chatbot ===")
     print("Commands:")
-    print("  define <topic>")
+    print("  define <topic> or what is <topic>")
     print("  weather in <city>")
     print("  time in <city>")
     print("  simplify        (replaces hard words in last reply)")
