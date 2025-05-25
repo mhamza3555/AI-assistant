@@ -1,136 +1,171 @@
-# === Simplified Local AI Chatbot (Wikipedia + Web Search + Local NLP) ===
-# Dependencies:
-# pip install wikipedia beautifulsoup4 requests nltk sumy
-
-import wikipedia
+import re
+import csv
 import requests
 from bs4 import BeautifulSoup
-import nltk
-from nltk.tokenize import sent_tokenize
-from nltk.corpus import wordnet
+import wikipedia
+import datetime
+import pytz
 
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lex_rank import LexRankSummarizer
+# --- Load synonyms for simplification ---
+synonym_dict = {}
+try:
+    with open('synonyms.csv', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            raw = row['difficult'].strip().lower()
+            key = re.sub(r'\d+$', '', raw)
+            easy = row.get('easy', row.get('simple', '')).strip()
+            if key and easy:
+                synonym_dict[key] = easy
+except FileNotFoundError:
+    print("Warning: 'synonyms.csv' not found. Simplify disabled.")
+except Exception as e:
+    print(f"Error loading synonyms.csv: {e}")
 
-# Download NLTK data
-nltk.download('punkt')
-nltk.download('wordnet')
+# --- Helper Functions ---
+def simplify_text(text):
+    def replace(match):
+        word = match.group(0)
+        key = word.lower()
+        simple = synonym_dict.get(key)
+        if not simple:
+            return word
+        if word[0].isupper(): simple = simple.capitalize()
+        return simple
+    return re.sub(r"\b\w+\b", replace, text)
 
-# Wikipedia Search
-def search_wikipedia(query):
+def search_wikipedia(query, sentences=2):
     try:
-        summary = wikipedia.summary(query, sentences=2)
-        return f"(From Wikipedia) {summary}"
-    except wikipedia.exceptions.DisambiguationError as e:
-        return f"Your query was too broad. Try being more specific. Options: {e.options[:5]}..."
-    except wikipedia.exceptions.PageError:
+        return wikipedia.summary(query, sentences=sentences)
+    except (wikipedia.exceptions.DisambiguationError, wikipedia.exceptions.PageError):
         return None
-    except Exception as e:
-        return f"Wikipedia error: {e}"
+    except Exception:
+        return None
 
-# Web Search using DuckDuckGo
-def search_web(query, max_results=3):
+def search_web(query):
     try:
-        params = {"q": query}
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get("https://html.duckduckgo.com/html/", params=params, headers=headers, timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
+        res = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        res.raise_for_status()
+        soup = BeautifulSoup(res.text, 'html.parser')
+        snippet = soup.find('a', class_='result__snippet')
+        if snippet and snippet.text.strip(): return snippet.text.strip()
+        title = soup.find('a', class_='result__a')
+        if title and title.text.strip(): return title.text.strip()
+        return None
+    except:
+        return None
 
-        results = soup.find_all("div", class_="result__body", limit=max_results)
-        snippets = []
-        for r in results:
-            snippet = r.find("a", class_="result__snippet")
-            title = r.find("a", class_="result__a")
-            if snippet and snippet.text.strip():
-                snippets.append(f"(From Web) {snippet.text.strip()}")
-            elif title and title.text.strip():
-                snippets.append(f"(From Web) {title.text.strip()}")
-        return snippets if snippets else None
-    except Exception as e:
-        return [f"Web search error: {e}"]
-
-# Local Rewording
-def reword(text):
+def get_time(city='UTC'):
+    # Attempt dynamic timezone lookup using pytz
+    city_key = city.strip().replace(' ', '_').title()
+    tz_name = None
+    # Exact match search
+    for tz in pytz.all_timezones:
+        if tz.endswith('/' + city_key):
+            tz_name = tz
+            break
+    # Contains match search
+    if not tz_name:
+        for tz in pytz.all_timezones:
+            if '/' + city_key + '/' in tz or tz.endswith('/' + city_key):
+                tz_name = tz
+                break
+    # Default to UTC if not found
+    if not tz_name:
+        tz_name = 'UTC'
     try:
-        sentences = sent_tokenize(text)
-        rewritten = []
-        for sent in sentences:
-            words = sent.split()
-            new_words = []
-            for word in words:
-                syns = wordnet.synsets(word)
-                if syns:
-                    synonym = syns[0].lemmas()[0].name().replace('_', ' ')
-                    new_words.append(synonym if synonym.lower() != word.lower() else word)
-                else:
-                    new_words.append(word)
-            rewritten.append(" ".join(new_words))
-        return " ".join(rewritten)
-    except Exception as e:
-        return f"Rewording error: {e}"
+        tz = pytz.timezone(tz_name)
+        now = datetime.datetime.now(tz)
+        return now.strftime('%Y-%m-%d %H:%M:%S %Z')
+    except Exception:
+        return None
 
-# Summary (Extractive Bullet Points) with fallback
+# use get_weather as before
 
-def summarize_bullets(text, n_sentences=3):
+def get_weather(city='Pakistan'):
     try:
-        parser = PlaintextParser.from_string(text, Tokenizer("english"))
-        summarizer = LexRankSummarizer()
-        summary = summarizer(parser.document, n_sentences)
-        return "\n".join(f"- {str(sentence)}" for sentence in summary)
-    except LookupError:
-        # Fallback: simple first sentences
-        sents = sent_tokenize(text)
-        return "\n".join(f"- {sents[i]}" for i in range(min(n_sentences, len(sents))))
+        resp = requests.get(f'https://wttr.in/{city}?format=3&lang=en')
+        return resp.text.strip()
+    except:
+        return None
 
-# Explanation (longer extractive summary)
-def explain_text(text):
-    return summarize_bullets(text, n_sentences=5)
+# --- Goal-Based Agent Components ---
+GOALS = {
+    'weather':      r"\bweather\b.*\bin\b\s*(?P<city>\w+)",
+    'time':         r"\btime\b.*\bin\b\s*(?P<city>\w+)",
+    'definition':   r"\bdefine\b.*(?P<topic>.+)",
+    'simplify':     r"\b(simplify|make it easier|easy version)\b" ,
+    'search':       r".+"
+}
 
-# Main Chatbot Loop
+def interpret_goal(text):
+    for goal, pattern in GOALS.items():
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return goal, m.groupdict()
+    return 'search', {'query': text}
+
+def plan(goal, params):
+    if goal == 'weather': return [('get_weather', params.get('city'))]
+    if goal == 'time':    return [('get_time', params.get('city'))]
+    if goal == 'definition': return [('wiki', params.get('topic'))]
+    if goal == 'simplify': return [('simplify', None)]
+    return [('wiki', params.get('query')), ('web', params.get('query'))]
+
+def execute(plan_steps, last_response):
+    for action, arg in plan_steps:
+        if action == 'get_time':
+            result = get_time(arg or 'UTC')
+        elif action == 'get_weather':
+            result = get_weather(arg or 'Pakistan')
+        elif action == 'wiki':
+            wiki = search_wikipedia(arg)
+            if wiki:
+                result = wiki
+            else:
+                continue
+        elif action == 'web':
+            web = search_web(arg)
+            if web:
+                result = web
+            else:
+                continue
+        elif action == 'simplify':
+            result = simplify_text(last_response)
+        else:
+            result = None
+        if result:
+            return result
+    return "Sorry, I couldn't fulfill that request."
+
+# --- Main Loop ---
 def main():
-    print("=== Smart AI Chatbot (Local NLP + Wikipedia + Web) ===")
-    print("Type 'exit' or 'quit' to stop.")
-    last_response = ""
+    print('=== Goal-Based AI Chatbot ===')
+    print('Commands:')
+    print('  define <topic>         → get definition')
+    print('  weather in <city>      → get weather')
+    print('  time in <city>         → get current time')
+    print('  simplify               → simplify last answer')
+    print('  exit                   → quit')
 
+    last_response = ''
     while True:
-        user_input = input("\nYou: ").strip()
-        if not user_input:
-            continue
-        if user_input.lower() in ["exit", "quit"]:
-            print("Assistant: Goodbye!")
+        user_input = input('\nYou: ').strip()
+        if not user_input: continue
+        if user_input.lower() in ('exit','quit'):
+            print('Assistant: Goodbye!')
             break
 
-        cmd = user_input.lower()
-        if any(kw in cmd for kw in ["reword"]):
-            if last_response:
-                response = reword(last_response)
-                print("Assistant (Reworded):", response)
-                last_response = response
-                continue
-        if any(kw in cmd for kw in ["explain", "expand", "elaborate"]):
-            if last_response:
-                response = explain_text(last_response)
-                print("Assistant (Explained):", response)
-                last_response = response
-                continue
+        goal, params = interpret_goal(user_input)
+        steps = plan(goal, params)
+        answer = execute(steps, last_response)
+        print('Assistant:', answer)
+        last_response = answer
 
-        # Regular queries
-        wiki_result = search_wikipedia(user_input)
-        if wiki_result:
-            print("Assistant:", wiki_result)
-            last_response = wiki_result
-            continue
-
-        web_results = search_web(user_input)
-        if web_results:
-            for idx, result in enumerate(web_results, 1):
-                print(f"Assistant (Web {idx}): {result}")
-            last_response = web_results[0]
-            continue
-
-        print("Assistant: Sorry, I couldn't find an answer.")
-        last_response = ""
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
