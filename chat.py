@@ -6,14 +6,14 @@ import wikipedia
 import datetime
 import pytz
 
-# --- Load synonyms for simplification ---
+# === Load synonyms for simplification ===
 synonym_dict = {}
 try:
     with open('synonyms.csv', newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
             raw = row['difficult'].strip().lower()
-            key = re.sub(r'\d+$', '', raw)
+            key = re.sub(r'\d+$', '', raw)            # strip any trailing digits
             easy = row.get('easy', row.get('simple', '')).strip()
             if key and easy:
                 synonym_dict[key] = easy
@@ -22,16 +22,15 @@ except FileNotFoundError:
 except Exception as e:
     print(f"Error loading synonyms.csv: {e}")
 
-# --- Helper Functions ---
+# === Helper Functions ===
 def simplify_text(text):
-    def replace(match):
-        word = match.group(0)
-        key = word.lower()
-        simple = synonym_dict.get(key)
-        if not simple:
-            return word
-        if word[0].isupper(): simple = simple.capitalize()
-        return simple
+    def replace(m):
+        w = m.group(0)
+        k = w.lower()
+        s = synonym_dict.get(k)
+        if not s:
+            return w
+        return s.capitalize() if w[0].isupper() else s
     return re.sub(r"\b\w+\b", replace, text)
 
 def search_wikipedia(query, sentences=2):
@@ -39,53 +38,48 @@ def search_wikipedia(query, sentences=2):
         return wikipedia.summary(query, sentences=sentences)
     except (wikipedia.exceptions.DisambiguationError, wikipedia.exceptions.PageError):
         return None
-    except Exception:
+    except:
         return None
 
 def search_web(query):
     try:
-        res = requests.get(
+        r = requests.get(
             "https://html.duckduckgo.com/html/",
             params={"q": query},
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10
         )
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, 'html.parser')
-        snippet = soup.find('a', class_='result__snippet')
-        if snippet and snippet.text.strip(): return snippet.text.strip()
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, 'html.parser')
+        snip = soup.find('a', class_='result__snippet')
+        if snip and snip.text.strip():
+            return snip.text.strip()
         title = soup.find('a', class_='result__a')
-        if title and title.text.strip(): return title.text.strip()
-        return None
+        if title and title.text.strip():
+            return title.text.strip()
     except:
-        return None
+        pass
+    return None
 
 def get_time(city='UTC'):
-    # Attempt dynamic timezone lookup using pytz
     city_key = city.strip().replace(' ', '_').title()
     tz_name = None
-    # Exact match search
     for tz in pytz.all_timezones:
         if tz.endswith('/' + city_key):
             tz_name = tz
             break
-    # Contains match search
     if not tz_name:
         for tz in pytz.all_timezones:
-            if '/' + city_key + '/' in tz or tz.endswith('/' + city_key):
+            if '/' + city_key + '/' in tz:
                 tz_name = tz
                 break
-    # Default to UTC if not found
     if not tz_name:
         tz_name = 'UTC'
     try:
-        tz = pytz.timezone(tz_name)
-        now = datetime.datetime.now(tz)
+        now = datetime.datetime.now(pytz.timezone(tz_name))
         return now.strftime('%Y-%m-%d %H:%M:%S %Z')
-    except Exception:
+    except:
         return None
-
-# use get_weather as before
 
 def get_weather(city='Pakistan'):
     try:
@@ -94,78 +88,76 @@ def get_weather(city='Pakistan'):
     except:
         return None
 
-# --- Goal-Based Agent Components ---
+# === Goal-Based Agent ===
 GOALS = {
-    'weather':      r"\bweather\b.*\bin\b\s*(?P<city>\w+)",
-    'time':         r"\btime\b.*\bin\b\s*(?P<city>\w+)",
-    'definition':   r"\bdefine\b.*(?P<topic>.+)",
-    'simplify':     r"\b(simplify|make it easier|easy version)\b" ,
-    'search':       r".+"
+    'weather':    r"\bweather\b.*\bin\b\s*(?P<city>[\w\s]+)",
+    'time':       r"\btime\b.*\bin\b\s*(?P<city>[\w\s]+)",
+    'define':     r"\b(?:define|definition)\b.*\bof\b\s*(?P<topic>.+)",
+    'simplify':   r"\b(?:simplify|make it easier|easy version)\b",
+    'search':     r".+"
 }
 
 def interpret_goal(text):
-    for goal, pattern in GOALS.items():
-        m = re.search(pattern, text, re.IGNORECASE)
+    for goal, pat in GOALS.items():
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
             return goal, m.groupdict()
     return 'search', {'query': text}
 
 def plan(goal, params):
-    if goal == 'weather': return [('get_weather', params.get('city'))]
-    if goal == 'time':    return [('get_time', params.get('city'))]
-    if goal == 'definition': return [('wiki', params.get('topic'))]
-    if goal == 'simplify': return [('simplify', None)]
+    if goal == 'weather':
+        return [('weather', params.get('city'))]
+    if goal == 'time':
+        return [('time', params.get('city'))]
+    if goal in ('define',):
+        return [('wiki', params.get('topic'))]
+    if goal == 'simplify':
+        return [('simplify', None)]
     return [('wiki', params.get('query')), ('web', params.get('query'))]
 
-def execute(plan_steps, last_response):
-    for action, arg in plan_steps:
-        if action == 'get_time':
-            result = get_time(arg or 'UTC')
-        elif action == 'get_weather':
-            result = get_weather(arg or 'Pakistan')
+def execute(steps, last_resp):
+    for action, arg in steps:
+        if action == 'weather':
+            res = get_weather(arg or 'Pakistan')
+        elif action == 'time':
+            res = get_time(arg or 'UTC')
         elif action == 'wiki':
-            wiki = search_wikipedia(arg)
-            if wiki:
-                result = wiki
-            else:
-                continue
+            res = search_wikipedia(arg)
         elif action == 'web':
-            web = search_web(arg)
-            if web:
-                result = web
-            else:
-                continue
+            res = search_web(arg)
         elif action == 'simplify':
-            result = simplify_text(last_response)
+            res = simplify_text(last_resp)
         else:
-            result = None
-        if result:
-            return result
+            res = None
+
+        if res:
+            return res
     return "Sorry, I couldn't fulfill that request."
 
-# --- Main Loop ---
+# === Main Loop ===
 def main():
-    print('=== Goal-Based AI Chatbot ===')
-    print('Commands:')
-    print('  define <topic>         → get definition')
-    print('  weather in <city>      → get weather')
-    print('  time in <city>         → get current time')
-    print('  simplify               → simplify last answer')
-    print('  exit                   → quit')
+    print("=== Goal‑Based AI Chatbot ===")
+    print("Commands:")
+    print("  define <topic>")
+    print("  weather in <city>")
+    print("  time in <city>")
+    print("  simplify        (replaces hard words in last reply)")
+    print("  exit")
+    last = ""
 
-    last_response = ''
     while True:
-        user_input = input('\nYou: ').strip()
-        if not user_input: continue
-        if user_input.lower() in ('exit','quit'):
-            print('Assistant: Goodbye!')
+        user = input("\nYou: ").strip()
+        if not user:
+            continue
+        if user.lower() in ('exit', 'quit'):
+            print("Assistant: Goodbye!")
             break
 
-        goal, params = interpret_goal(user_input)
+        goal, params = interpret_goal(user)
         steps = plan(goal, params)
-        answer = execute(steps, last_response)
-        print('Assistant:', answer)
-        last_response = answer
+        reply = execute(steps, last)
+        print("Assistant:", reply)
+        last = reply
 
 if __name__ == '__main__':
     main()
